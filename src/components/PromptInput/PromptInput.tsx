@@ -1548,7 +1548,7 @@ function PromptInput({
     });
 
     // If this is a teammate, update config.json so team lead sees the change
-    syncTeammateMode(nextMode, teamContext?.teamName);
+    void syncTeammateMode(nextMode, teamContext?.teamName);
 
     // Close help tips if they're open when mode is cycled
     if (helpOpen) {

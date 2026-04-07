@@ -12,6 +12,7 @@ import { applyPermissionUpdate } from '../permissions/PermissionUpdate.js'
 import { jsonStringify } from '../slowOperations.js'
 import { getTeammateColor } from '../teammate.js'
 import {
+  createHeartbeatMessage,
   createIdleNotification,
   getLastPeerDmSummary,
   writeToMailbox,
@@ -93,6 +94,25 @@ export function initializeTeammateHooks(
   logForDebugging(
     `[TeammateInit] Registering Stop hook for teammate ${agentName} to notify leader ${leadAgentName}`,
   )
+
+  // Send periodic heartbeats so the leader can detect if this process dies.
+  // The interval is intentionally left running until process exit — that's the
+  // point: absence of heartbeats signals a crash to the leader.
+  // unref() prevents the interval from keeping Node.js alive after the main
+  // work is done.
+  const HEARTBEAT_INTERVAL_MS = 15_000
+  const heartbeatInterval = setInterval(async () => {
+    await writeToMailbox(leadAgentName, {
+      from: agentName,
+      text: jsonStringify(createHeartbeatMessage(agentName)),
+      timestamp: new Date().toISOString(),
+      color: getTeammateColor(),
+    })
+    logForDebugging(
+      `[TeammateInit] Sent heartbeat to leader ${leadAgentName}`,
+    )
+  }, HEARTBEAT_INTERVAL_MS)
+  heartbeatInterval.unref()
 
   // Register Stop hook to notify leader when this teammate stops
   addFunctionHook(

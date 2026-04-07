@@ -23,6 +23,7 @@ export {
 } from './teammateContext.js'
 
 import type { AppState } from '../state/AppState.js'
+import { isTerminalTaskStatus } from '../Task.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getTeammateContext } from './teammateContext.js'
 
@@ -231,13 +232,24 @@ export function hasWorkingInProcessTeammates(appState: AppState): boolean {
 }
 
 /**
+ * How long waitForTeammatesToBecomeIdle will wait before giving up.
+ * Prevents the leader from hanging indefinitely when a teammate crashes
+ * or exits without sending an idle notification.
+ */
+const WAIT_FOR_IDLE_TIMEOUT_MS = 30_000
+
+/**
  * Returns a promise that resolves when all working in-process teammates become idle.
  * Registers callbacks on each working teammate's task - they call these when idle.
  * Returns immediately if no teammates are working.
+ *
+ * Resolves after `timeoutMs` even if some teammates never become idle, so a
+ * crashed or stuck teammate cannot block the leader indefinitely.
  */
 export function waitForTeammatesToBecomeIdle(
   setAppState: (f: (prev: AppState) => AppState) => void,
   appState: AppState,
+  timeoutMs = WAIT_FOR_IDLE_TIMEOUT_MS,
 ): Promise<void> {
   const workingTaskIds: string[] = []
 
@@ -255,34 +267,56 @@ export function waitForTeammatesToBecomeIdle(
     return Promise.resolve()
   }
 
-  // Create a promise that resolves when all working teammates become idle
   return new Promise<void>(resolve => {
     let remaining = workingTaskIds.length
+    let settled = false
+
+    // Idempotent settler — only the first call to settle() wins.
+    // This prevents double-resolving when both a callback fires and the
+    // timeout fires, or when the same callback is invoked more than once.
+    const settle = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeoutHandle)
+      resolve()
+    }
 
     const onIdle = (): void => {
       remaining--
-      if (remaining === 0) {
-        // biome-ignore lint/nursery/noFloatingPromises: resolve is a callback, not a Promise
-        resolve()
-      }
+      if (remaining <= 0) settle()
     }
 
-    // Register callback on each working teammate
-    // Check current isIdle state to handle race where teammate became idle
-    // between our initial snapshot and this callback registration
+    // Timeout guard: if any teammate crashes without calling its idle callbacks,
+    // resolve after timeoutMs so the leader is never blocked indefinitely.
+    const timeoutHandle = setTimeout(settle, timeoutMs)
+    // unref() so the timeout does not prevent a clean process exit when the
+    // rest of the work is done before the timer fires.
+    if (typeof (timeoutHandle as NodeJS.Timeout).unref === 'function') {
+      ;(timeoutHandle as NodeJS.Timeout).unref()
+    }
+
+    // Register callback on each working teammate.
+    // Re-read current state inside setAppState to catch races where a task
+    // transitioned between our initial snapshot and this callback registration.
     setAppState(prev => {
       const newTasks = { ...prev.tasks }
       for (const taskId of workingTaskIds) {
         const task = newTasks[taskId]
-        if (task && task.type === 'in_process_teammate') {
-          // If task is already idle, call onIdle immediately
-          if (task.isIdle) {
-            onIdle()
-          } else {
-            newTasks[taskId] = {
-              ...task,
-              onIdleCallbacks: [...(task.onIdleCallbacks ?? []), onIdle],
-            }
+
+        // Task disappeared entirely — treat as idle to avoid hanging.
+        if (!task || task.type !== 'in_process_teammate') {
+          onIdle()
+          continue
+        }
+
+        // Task already idle, or already in a terminal state (completed/failed/killed):
+        // its onIdleCallbacks will never fire again, so unblock the waiter now.
+        if (task.isIdle || isTerminalTaskStatus(task.status)) {
+          onIdle()
+        } else {
+          newTasks[taskId] = {
+            ...task,
+            onIdleCallbacks: [...(task.onIdleCallbacks ?? []), onIdle],
           }
         }
       }

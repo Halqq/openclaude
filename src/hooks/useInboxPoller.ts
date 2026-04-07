@@ -49,6 +49,7 @@ import {
 } from '../utils/teammate.js'
 import { isInProcessTeammate } from '../utils/teammateContext.js'
 import {
+  isHeartbeat,
   isModeSetRequest,
   isPermissionRequest,
   isPermissionResponse,
@@ -105,6 +106,11 @@ function getAgentNameToPoll(appState: AppState): string | undefined {
 }
 
 const INBOX_POLL_INTERVAL_MS = 1000
+// How often teammates send heartbeats (must match teammateInit.ts)
+const HEARTBEAT_INTERVAL_MS = 15_000
+// After 3 missed heartbeat intervals, the leader considers the teammate dead
+const HEARTBEAT_TIMEOUT_MS = HEARTBEAT_INTERVAL_MS * 3
+const DEAD_TEAMMATE_CHECK_INTERVAL_MS = 5_000
 
 type Props = {
   enabled: boolean
@@ -135,6 +141,10 @@ export function useInboxPoller({
   const setAppState = useSetAppState()
   const inboxMessageCount = useAppState(s => s.inbox.messages.length)
   const terminal = useTerminalNotification()
+  // Tracks the last time a heartbeat was received from each named teammate.
+  // Populated only after the first heartbeat — teammates without an entry are
+  // not yet being tracked (avoids false positives on startup).
+  const lastHeartbeatRef = useRef<Map<string, number>>(new Map())
 
   const poll = useCallback(async () => {
     if (!enabled) return
@@ -211,6 +221,7 @@ export function useInboxPoller({
     const teamPermissionUpdates: TeammateMessage[] = []
     const modeSetRequests: TeammateMessage[] = []
     const planApprovalRequests: TeammateMessage[] = []
+    const heartbeatMessages: TeammateMessage[] = []
     const regularMessages: TeammateMessage[] = []
 
     for (const m of unread) {
@@ -223,6 +234,7 @@ export function useInboxPoller({
       const teamPermUpdate = isTeamPermissionUpdate(m.text)
       const modeSetReq = isModeSetRequest(m.text)
       const planApprovalReq = isPlanApprovalRequest(m.text)
+      const heartbeat = isHeartbeat(m.text)
 
       if (permReq) {
         permissionRequests.push(m)
@@ -242,6 +254,8 @@ export function useInboxPoller({
         modeSetRequests.push(m)
       } else if (planApprovalReq) {
         planApprovalRequests.push(m)
+      } else if (heartbeat) {
+        heartbeatMessages.push(m)
       } else {
         regularMessages.push(m)
       }
@@ -591,7 +605,7 @@ export function useInboxPoller({
         const teamName = currentAppState.teamContext?.teamName
         const agentName = getAgentName()
         if (teamName && agentName) {
-          setMemberMode(teamName, agentName, targetMode)
+          void setMemberMode(teamName, agentName, targetMode)
         }
       }
     }
@@ -658,6 +672,15 @@ export function useInboxPoller({
         // Still pass through as a regular message so the model has context
         // about what the teammate is doing, but the approval is already sent
         regularMessages.push(m)
+      }
+    }
+
+    // Handle heartbeat messages (leader side) — update last-seen timestamp per teammate.
+    // Heartbeats are silently consumed and never forwarded to the LLM.
+    if (heartbeatMessages.length > 0 && isTeamLead(currentAppState.teamContext)) {
+      for (const m of heartbeatMessages) {
+        lastHeartbeatRef.current.set(m.from, Date.now())
+        logForDebugging(`[InboxPoller] Heartbeat from ${m.from}`)
       }
     }
 
@@ -952,6 +975,91 @@ export function useInboxPoller({
   // Poll if running as a teammate or as a team lead
   const shouldPoll = enabled && !!getAgentNameToPoll(store.getState())
   useInterval(() => void poll(), shouldPoll ? INBOX_POLL_INTERVAL_MS : null)
+
+  // Dead-teammate detection: check whether any known teammate has missed too many
+  // heartbeats, which indicates the tmux pane crashed or was killed externally.
+  // Only runs on the leader side; in-process teammates are tracked via AppState directly.
+  const checkDeadTeammates = useCallback(() => {
+    const currentAppState = store.getState()
+    if (!enabled || !isTeamLead(currentAppState.teamContext)) return
+
+    const now = Date.now()
+    for (const [name, lastAt] of lastHeartbeatRef.current.entries()) {
+      if (now - lastAt <= HEARTBEAT_TIMEOUT_MS) continue
+
+      // Remove from tracking first to prevent duplicate handling
+      lastHeartbeatRef.current.delete(name)
+      logForDebugging(
+        `[InboxPoller] Dead teammate detected: ${name} — no heartbeat for ${now - lastAt}ms`,
+      )
+
+      const teamName = currentAppState.teamContext?.teamName
+      const teammateId = Object.entries(
+        currentAppState.teamContext!.teammates,
+      ).find(([, t]) => t.name === name)?.[0]
+
+      if (!teammateId) continue
+
+      if (teamName) {
+        removeTeammateFromTeamFile(teamName, { agentId: teammateId, name })
+      }
+
+      void (async () => {
+        const { notificationMessage } = teamName
+          ? await unassignTeammateTasks(teamName, teammateId, name, 'shutdown')
+          : {
+              notificationMessage: `${name} stopped responding (heartbeat timeout).`,
+            }
+
+        setAppState(prev => {
+          if (!prev.teamContext?.teammates) return prev
+          if (!(teammateId in prev.teamContext.teammates)) return prev
+          const { [teammateId]: _removed, ...remainingTeammates } =
+            prev.teamContext.teammates
+
+          const updatedTasks = { ...prev.tasks }
+          for (const [tid, task] of Object.entries(updatedTasks)) {
+            if (
+              isInProcessTeammateTask(task) &&
+              task.identity.agentId === teammateId
+            ) {
+              updatedTasks[tid] = {
+                ...task,
+                status: 'completed' as const,
+                endTime: Date.now(),
+              }
+            }
+          }
+
+          return {
+            ...prev,
+            tasks: updatedTasks,
+            teamContext: {
+              ...prev.teamContext,
+              teammates: remainingTeammates,
+            },
+            inbox: {
+              messages: [
+                ...prev.inbox.messages,
+                {
+                  id: randomUUID(),
+                  from: 'system',
+                  text: jsonStringify({
+                    type: 'teammate_terminated',
+                    message: notificationMessage,
+                  }),
+                  timestamp: new Date().toISOString(),
+                  status: 'pending' as const,
+                },
+              ],
+            },
+          }
+        })
+      })()
+    }
+  }, [enabled, store, setAppState])
+
+  useInterval(checkDeadTeammates, enabled ? DEAD_TEAMMATE_CHECK_INTERVAL_MS : null)
 
   // Initial poll on mount (only once)
   const hasDoneInitialPollRef = useRef(false)

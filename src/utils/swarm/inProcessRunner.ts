@@ -382,7 +382,20 @@ function createInProcessCanUseTool(
       // Send request to leader's mailbox
       void sendPermissionRequestViaMailbox(request)
 
-      // Poll teammate's mailbox for the response
+      // Poll teammate's mailbox for the response.
+      // cleanup() is idempotent (guarded by `settled`) so it is safe to call
+      // from both the abort listener and the interval callback without risk of
+      // a double-clearInterval / double-unregister race.
+      let settled = false
+
+      function cleanup() {
+        if (settled) return
+        settled = true
+        clearInterval(pollInterval)
+        unregisterPermissionCallback(request.id)
+        abortController.signal.removeEventListener('abort', onAbortListener)
+      }
+
       const pollInterval = setInterval(
         async (abortController, cleanup, resolve, identity, request) => {
           if (abortController.signal.aborted) {
@@ -391,10 +404,17 @@ function createInProcessCanUseTool(
             return
           }
 
-          const allMessages = await readMailbox(
-            identity.agentName,
-            identity.teamName,
-          )
+          let allMessages
+          try {
+            allMessages = await readMailbox(
+              identity.agentName,
+              identity.teamName,
+            )
+          } catch {
+            // Transient I/O error — skip this tick and retry on the next one.
+            return
+          }
+
           for (let i = 0; i < allMessages.length; i++) {
             const msg = allMessages[i]
             if (msg && !msg.read) {
@@ -419,7 +439,9 @@ function createInProcessCanUseTool(
                     feedback: parsed.error,
                   })
                 }
-                return // Callback already resolves the promise
+                // Stop polling now that the response has been processed.
+                cleanup()
+                return
               }
             }
           }
@@ -440,12 +462,6 @@ function createInProcessCanUseTool(
       abortController.signal.addEventListener('abort', onAbortListener, {
         once: true,
       })
-
-      function cleanup() {
-        clearInterval(pollInterval)
-        unregisterPermissionCallback(request.id)
-        abortController.signal.removeEventListener('abort', onAbortListener)
-      }
     })
   }
 }

@@ -644,7 +644,7 @@ async function showTeammate(teammate: TeammateStatus, teamName: string): Promise
  */
 function sendModeChangeToTeammate(teammateName: string, teamName: string, targetMode: PermissionMode): void {
   // Update config.json directly so UI shows the change immediately
-  setMemberMode(teamName, teammateName, targetMode);
+  void setMemberMode(teamName, teammateName, targetMode);
 
   // Also send message so teammate updates their local permission context
   const message = createModeSetRequestMessage({

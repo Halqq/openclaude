@@ -23,6 +23,7 @@ import { lazySchema } from './lazySchema.js'
 import * as lockfile from './lockfile.js'
 import { logError } from './log.js'
 import { jsonParse, jsonStringify } from './slowOperations.js'
+import { sleep } from './sleep.js'
 import type { BackendType } from './swarm/backends/types.js'
 import { TEAM_LEAD_NAME } from './swarm/constants.js'
 import { sanitizePathComponent } from './tasks.js'
@@ -39,6 +40,11 @@ const LOCK_OPTIONS = {
     maxTimeout: 100,
   },
 }
+
+// When all lock retries are exhausted, retry the entire write operation
+// to prevent messages from being silently discarded under high contention.
+const MAILBOX_WRITE_MAX_ATTEMPTS = 4
+const MAILBOX_WRITE_RETRY_DELAY_MS = 200
 
 export type TeammateMessage = {
   from: string
@@ -160,35 +166,53 @@ export async function writeToMailbox(
     }
   }
 
-  let release: (() => Promise<void>) | undefined
-  try {
-    release = await lockfile.lock(inboxPath, {
-      lockfilePath: lockFilePath,
-      ...LOCK_OPTIONS,
-    })
-
-    // Re-read messages after acquiring lock to get the latest state
-    const messages = await readMailbox(recipientName, teamName)
-
-    const newMessage: TeammateMessage = {
-      ...message,
-      read: false,
+  let lastError: unknown
+  for (let attempt = 0; attempt < MAILBOX_WRITE_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await sleep(MAILBOX_WRITE_RETRY_DELAY_MS * attempt)
+      logForDebugging(
+        `[TeammateMailbox] writeToMailbox: retry ${attempt}/${MAILBOX_WRITE_MAX_ATTEMPTS - 1} for recipient=${recipientName}`,
+      )
     }
 
-    messages.push(newMessage)
+    let release: (() => Promise<void>) | undefined
+    try {
+      release = await lockfile.lock(inboxPath, {
+        lockfilePath: lockFilePath,
+        ...LOCK_OPTIONS,
+      })
 
-    await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
-    logForDebugging(
-      `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
-    )
-  } catch (error) {
-    logForDebugging(`Failed to write to inbox for ${recipientName}: ${error}`)
-    logError(error)
-  } finally {
-    if (release) {
-      await release()
+      // Re-read messages after acquiring lock to get the latest state
+      const messages = await readMailbox(recipientName, teamName)
+
+      const newMessage: TeammateMessage = {
+        ...message,
+        read: false,
+      }
+
+      messages.push(newMessage)
+
+      await writeFile(inboxPath, jsonStringify(messages, null, 2), 'utf-8')
+      logForDebugging(
+        `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
+      )
+      return
+    } catch (error) {
+      lastError = error
+      logForDebugging(
+        `[TeammateMailbox] writeToMailbox: attempt ${attempt + 1}/${MAILBOX_WRITE_MAX_ATTEMPTS} failed for ${recipientName}: ${error}`,
+      )
+    } finally {
+      if (release) {
+        await release()
+      }
     }
   }
+
+  logForDebugging(
+    `[TeammateMailbox] Failed to write to inbox for ${recipientName} after ${MAILBOX_WRITE_MAX_ATTEMPTS} attempts: ${lastError}`,
+  )
+  logError(lastError)
 }
 
 /**
@@ -803,6 +827,42 @@ export function createShutdownApprovedMessage(params: {
 }
 
 /**
+ * Heartbeat message sent periodically by process-based teammates so the leader
+ * can detect crashes (tmux pane killed, disconnect, OOM, etc.).
+ */
+export type HeartbeatMessage = {
+  type: 'heartbeat'
+  from: string
+  timestamp: string
+}
+
+/**
+ * Creates a heartbeat message to send to the team leader
+ */
+export function createHeartbeatMessage(from: string): HeartbeatMessage {
+  return {
+    type: 'heartbeat',
+    from,
+    timestamp: new Date().toISOString(),
+  }
+}
+
+/**
+ * Checks if a message text contains a heartbeat
+ */
+export function isHeartbeat(messageText: string): HeartbeatMessage | null {
+  try {
+    const parsed = jsonParse(messageText)
+    if (parsed && parsed.type === 'heartbeat') {
+      return parsed as HeartbeatMessage
+    }
+  } catch {
+    // Not JSON or not a heartbeat
+  }
+  return null
+}
+
+/**
  * Creates a shutdown rejected message to send to the team leader
  */
 export function createShutdownRejectedMessage(params: {
@@ -1087,7 +1147,8 @@ export function isStructuredProtocolMessage(messageText: string): boolean {
       type === 'team_permission_update' ||
       type === 'mode_set_request' ||
       type === 'plan_approval_request' ||
-      type === 'plan_approval_response'
+      type === 'plan_approval_response' ||
+      type === 'heartbeat'
     )
   } catch {
     return false

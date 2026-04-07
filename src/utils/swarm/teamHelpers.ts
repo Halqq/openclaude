@@ -9,12 +9,21 @@ import { errorMessage, getErrnoCode } from '../errors.js'
 import { execFileNoThrowWithCwd } from '../execFileNoThrow.js'
 import { gitExe } from '../git.js'
 import { lazySchema } from '../lazySchema.js'
+import * as lockfile from '../lockfile.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { jsonParse, jsonStringify } from '../slowOperations.js'
 import { getTasksDir, notifyTasksUpdated } from '../tasks.js'
 import { getAgentName, getTeamName, isTeammate } from '../teammate.js'
 import { type BackendType, isPaneBackend } from './backends/types.js'
 import { TEAM_LEAD_NAME } from './constants.js'
+
+const TEAM_CONFIG_LOCK_OPTIONS = {
+  retries: {
+    retries: 10,
+    minTimeout: 5,
+    maxTimeout: 100,
+  },
+}
 
 export const inputSchema = lazySchema(() =>
   z.strictObject({
@@ -349,43 +358,64 @@ export function removeMemberByAgentId(
 
 /**
  * Sets a team member's permission mode.
- * Called when the team leader changes a teammate's mode via the TeamsDialog.
+ * Uses file locking to prevent concurrent writes from multiple processes
+ * (e.g. two teammates updating their own mode at the same time) from
+ * overwriting each other's changes to config.json.
  * @param teamName - The name of the team
  * @param memberName - The name of the member to update
  * @param mode - The new permission mode
  */
-export function setMemberMode(
+export async function setMemberMode(
   teamName: string,
   memberName: string,
   mode: PermissionMode,
-): boolean {
-  const teamFile = readTeamFile(teamName)
-  if (!teamFile) {
-    return false
-  }
+): Promise<boolean> {
+  const configPath = getTeamFilePath(teamName)
+  const lockFilePath = `${configPath}.lock`
 
-  const member = teamFile.members.find(m => m.name === memberName)
-  if (!member) {
+  let release: (() => Promise<void>) | undefined
+  try {
+    release = await lockfile.lock(configPath, {
+      lockfilePath: lockFilePath,
+      ...TEAM_CONFIG_LOCK_OPTIONS,
+    })
+
+    const teamFile = await readTeamFileAsync(teamName)
+    if (!teamFile) {
+      return false
+    }
+
+    const member = teamFile.members.find(m => m.name === memberName)
+    if (!member) {
+      logForDebugging(
+        `[TeammateTool] Cannot set member mode: member ${memberName} not found in team ${teamName}`,
+      )
+      return false
+    }
+
+    // Only write if the value is actually changing
+    if (member.mode === mode) {
+      return true
+    }
+
+    const updatedMembers = teamFile.members.map(m =>
+      m.name === memberName ? { ...m, mode } : m,
+    )
+    await writeTeamFileAsync(teamName, { ...teamFile, members: updatedMembers })
     logForDebugging(
-      `[TeammateTool] Cannot set member mode: member ${memberName} not found in team ${teamName}`,
+      `[TeammateTool] Set member ${memberName} in team ${teamName} to mode: ${mode}`,
+    )
+    return true
+  } catch (error) {
+    const code = getErrnoCode(error)
+    if (code === 'ENOENT') return false
+    logForDebugging(
+      `[TeammateTool] setMemberMode failed for ${memberName}: ${errorMessage(error)}`,
     )
     return false
+  } finally {
+    if (release) await release()
   }
-
-  // Only write if the value is actually changing
-  if (member.mode === mode) {
-    return true
-  }
-
-  // Create updated members array immutably
-  const updatedMembers = teamFile.members.map(m =>
-    m.name === memberName ? { ...m, mode } : m,
-  )
-  writeTeamFile(teamName, { ...teamFile, members: updatedMembers })
-  logForDebugging(
-    `[TeammateTool] Set member ${memberName} in team ${teamName} to mode: ${mode}`,
-  )
-  return true
 }
 
 /**
@@ -394,15 +424,15 @@ export function setMemberMode(
  * @param mode - The permission mode to sync
  * @param teamNameOverride - Optional team name override (uses env var if not provided)
  */
-export function syncTeammateMode(
+export async function syncTeammateMode(
   mode: PermissionMode,
   teamNameOverride?: string,
-): void {
+): Promise<void> {
   if (!isTeammate()) return
   const teamName = teamNameOverride ?? getTeamName()
   const agentName = getAgentName()
   if (teamName && agentName) {
-    setMemberMode(teamName, agentName, mode)
+    await setMemberMode(teamName, agentName, mode)
   }
 }
 
@@ -447,6 +477,8 @@ export function setMultipleMemberModes(
 /**
  * Sets a team member's active status.
  * Called when a teammate becomes idle (isActive=false) or starts a new turn (isActive=true).
+ * Uses file locking to prevent concurrent writes from multiple teammates (each
+ * running in their own tmux pane process) from overwriting each other's changes.
  * @param teamName - The name of the team
  * @param memberName - The name of the member to update
  * @param isActive - Whether the member is active (true) or idle (false)
@@ -456,32 +488,52 @@ export async function setMemberActive(
   memberName: string,
   isActive: boolean,
 ): Promise<void> {
-  const teamFile = await readTeamFileAsync(teamName)
-  if (!teamFile) {
+  const configPath = getTeamFilePath(teamName)
+  const lockFilePath = `${configPath}.lock`
+
+  let release: (() => Promise<void>) | undefined
+  try {
+    release = await lockfile.lock(configPath, {
+      lockfilePath: lockFilePath,
+      ...TEAM_CONFIG_LOCK_OPTIONS,
+    })
+
+    // Re-read inside the lock to get the latest state
+    const teamFile = await readTeamFileAsync(teamName)
+    if (!teamFile) {
+      logForDebugging(
+        `[TeammateTool] Cannot set member active: team ${teamName} not found`,
+      )
+      return
+    }
+
+    const member = teamFile.members.find(m => m.name === memberName)
+    if (!member) {
+      logForDebugging(
+        `[TeammateTool] Cannot set member active: member ${memberName} not found in team ${teamName}`,
+      )
+      return
+    }
+
+    // Only write if the value is actually changing
+    if (member.isActive === isActive) {
+      return
+    }
+
+    member.isActive = isActive
+    await writeTeamFileAsync(teamName, teamFile)
     logForDebugging(
-      `[TeammateTool] Cannot set member active: team ${teamName} not found`,
+      `[TeammateTool] Set member ${memberName} in team ${teamName} to ${isActive ? 'active' : 'idle'}`,
     )
-    return
-  }
-
-  const member = teamFile.members.find(m => m.name === memberName)
-  if (!member) {
+  } catch (error) {
+    const code = getErrnoCode(error)
+    if (code === 'ENOENT') return
     logForDebugging(
-      `[TeammateTool] Cannot set member active: member ${memberName} not found in team ${teamName}`,
+      `[TeammateTool] setMemberActive failed for ${memberName}: ${errorMessage(error)}`,
     )
-    return
+  } finally {
+    if (release) await release()
   }
-
-  // Only write if the value is actually changing
-  if (member.isActive === isActive) {
-    return
-  }
-
-  member.isActive = isActive
-  await writeTeamFileAsync(teamName, teamFile)
-  logForDebugging(
-    `[TeammateTool] Set member ${memberName} in team ${teamName} to ${isActive ? 'active' : 'idle'}`,
-  )
 }
 
 /**
