@@ -8,11 +8,77 @@
  * - src/ path aliases
  */
 
-import { readFileSync } from 'fs'
+import { readFileSync, existsSync, cpSync, mkdirSync } from 'fs'
 import { noTelemetryPlugin } from './no-telemetry-plugin'
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf-8'))
 const version = pkg.version
+
+// --- Ripgrep vendoring -------------------------------------------------------
+const RIPGREP_VERSION = '14.1.1'
+const RIPGREP_RELEASES = `https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}`
+
+function ripgrepTarget(): { archive: string; subdir: string } | null {
+  const { platform, arch } = process
+  // Map node arch/platform to the subdir naming convention used by the ripgrep config
+  const subdir = `${arch}-${platform}`
+  if (platform === 'darwin') {
+    if (arch === 'arm64') return { archive: `ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin`, subdir }
+    if (arch === 'x64') return { archive: `ripgrep-${RIPGREP_VERSION}-x86_64-apple-darwin`, subdir }
+  }
+  if (platform === 'linux') {
+    if (arch === 'arm64') return { archive: `ripgrep-${RIPGREP_VERSION}-aarch64-unknown-linux-musl`, subdir }
+    if (arch === 'x64') return { archive: `ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl`, subdir }
+  }
+  if (platform === 'win32') {
+    if (arch === 'x64') return { archive: `ripgrep-${RIPGREP_VERSION}-x86_64-pc-windows-msvc`, subdir }
+  }
+  return null
+}
+
+async function downloadRipgrep(destDir: string): Promise<boolean> {
+  const targetInfo = ripgrepTarget()
+  if (!targetInfo) {
+    console.warn(`⚠ No prebuilt ripgrep for ${process.platform}/${process.arch}`)
+    return false
+  }
+
+  const archiveExt = process.platform === 'win32' ? '.zip' : '.tar.gz'
+  const archiveName = `${targetInfo.archive}${archiveExt}`
+  const url = `${RIPGREP_RELEASES}/${archiveName}`
+  const tmpDir = destDir + '/_tmp_rg'
+
+  console.log(`↓ Downloading ripgrep ${RIPGREP_VERSION} from ${url}`)
+
+  try {
+    const resp = await fetch(url)
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const buf = Buffer.from(await resp.arrayBuffer())
+
+    mkdirSync(tmpDir, { recursive: true })
+    await Bun.write(`${tmpDir}/${archiveName}`, buf)
+
+    // Extract archive
+    await Bun.spawn(['tar', 'xzf', `${tmpDir}/${archiveName}`, '-C', tmpDir]).exited
+
+    // Place binary in the correct subdir: {destDir}/{arch-platform}/rg
+    const extracted = tmpDir + '/' + targetInfo.archive
+    const binSubdir = `${destDir}/${targetInfo.subdir}`
+    mkdirSync(binSubdir, { recursive: true })
+
+    const rgBinary = process.platform === 'win32' ? 'rg.exe' : 'rg'
+    cpSync(`${extracted}/${rgBinary}`, `${binSubdir}/${rgBinary}`)
+
+    // Clean up temp dir
+    try { await Bun.spawn(['rm', '-rf', tmpDir]).exited } catch {}
+
+    console.log(`✓ Downloaded and extracted ripgrep ${RIPGREP_VERSION}`)
+    return true
+  } catch (err) {
+    console.warn(`⚠ Failed to download ripgrep: ${(err as Error).message}`)
+    return false
+  }
+}
 
 // Feature flags for the open build.
 // Most Anthropic-internal features stay off; open-build features can be
@@ -393,3 +459,16 @@ if (!result.success) {
 }
 
 console.log(`✓ Built openclaude v${version} → dist/cli.mjs`)
+
+// Copy or download vendored ripgrep binary into dist/vendor/ripgrep/
+const srcVendor = './vendor/ripgrep'
+const dstVendor = './dist/vendor/ripgrep'
+if (existsSync(srcVendor)) {
+  mkdirSync(dstVendor, { recursive: true })
+  cpSync(srcVendor, dstVendor, { recursive: true, dereference: true })
+  console.log(`✓ Copied vendor/ripgrep → dist/vendor/ripgrep`)
+} else if (await downloadRipgrep(dstVendor)) {
+  // downloaded successfully
+} else {
+  console.warn('⚠ ripgrep not available — file search will fall back to system `rg`')
+}

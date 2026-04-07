@@ -9,6 +9,7 @@
   "files": [
     "bin/",
     "dist/cli.mjs",
+    "dist/vendor/",
     "README.md"
   ],
   "scripts": {
