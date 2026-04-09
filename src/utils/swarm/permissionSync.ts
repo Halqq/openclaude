@@ -697,7 +697,7 @@ export async function sendPermissionRequestViaMailbox(
     })
 
     // Send to leader's mailbox (routes to in-process or file-based based on recipient)
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       leaderName,
       {
         from: request.workerName,
@@ -707,6 +707,13 @@ export async function sendPermissionRequestViaMailbox(
       },
       request.teamName,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[PermissionSync] Failed to deliver permission request ${request.id} to leader ${leaderName} — mailbox write failed after retries`,
+      )
+      return false
+    }
 
     logForDebugging(
       `[PermissionSync] Sent permission request ${request.id} to leader ${leaderName} via mailbox`,
@@ -759,7 +766,7 @@ export async function sendPermissionResponseViaMailbox(
     const senderName = getAgentName() || 'team-lead'
 
     // Send to worker's mailbox (routes to in-process or file-based based on recipient)
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       workerName,
       {
         from: senderName,
@@ -768,6 +775,13 @@ export async function sendPermissionResponseViaMailbox(
       },
       team,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[PermissionSync] Failed to deliver permission response for ${requestId} to worker ${workerName} — mailbox write failed after retries`,
+      )
+      return false
+    }
 
     logForDebugging(
       `[PermissionSync] Sent permission response for ${requestId} to worker ${workerName} via mailbox`,
@@ -844,7 +858,7 @@ export async function sendSandboxPermissionRequestViaMailbox(
     })
 
     // Send to leader's mailbox (routes to in-process or file-based based on recipient)
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       leaderName,
       {
         from: workerName,
@@ -854,6 +868,13 @@ export async function sendSandboxPermissionRequestViaMailbox(
       },
       team,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[PermissionSync] Failed to deliver sandbox permission request ${requestId} for host ${host} to leader ${leaderName} — mailbox write failed after retries`,
+      )
+      return false
+    }
 
     logForDebugging(
       `[PermissionSync] Sent sandbox permission request ${requestId} for host ${host} to leader ${leaderName} via mailbox`,
@@ -904,7 +925,7 @@ export async function sendSandboxPermissionResponseViaMailbox(
     const senderName = getAgentName() || 'team-lead'
 
     // Send to worker's mailbox (routes to in-process or file-based based on recipient)
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       workerName,
       {
         from: senderName,
@@ -913,6 +934,13 @@ export async function sendSandboxPermissionResponseViaMailbox(
       },
       team,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[PermissionSync] Failed to deliver sandbox permission response for ${requestId} (host: ${host}, allow: ${allow}) to worker ${workerName} — mailbox write failed after retries`,
+      )
+      return false
+    }
 
     logForDebugging(
       `[PermissionSync] Sent sandbox permission response for ${requestId} (host: ${host}, allow: ${allow}) to worker ${workerName} via mailbox`,

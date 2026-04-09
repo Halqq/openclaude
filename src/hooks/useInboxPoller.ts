@@ -49,6 +49,7 @@ import {
 } from '../utils/teammate.js'
 import { isInProcessTeammate } from '../utils/teammateContext.js'
 import {
+  isForceShutdown,
   isHeartbeat,
   isModeSetRequest,
   isPermissionRequest,
@@ -222,6 +223,7 @@ export function useInboxPoller({
     const modeSetRequests: TeammateMessage[] = []
     const planApprovalRequests: TeammateMessage[] = []
     const heartbeatMessages: TeammateMessage[] = []
+    const forceShutdownMessages: TeammateMessage[] = []
     const regularMessages: TeammateMessage[] = []
 
     for (const m of unread) {
@@ -235,6 +237,7 @@ export function useInboxPoller({
       const modeSetReq = isModeSetRequest(m.text)
       const planApprovalReq = isPlanApprovalRequest(m.text)
       const heartbeat = isHeartbeat(m.text)
+      const forceShutdown = isForceShutdown(m.text)
 
       if (permReq) {
         permissionRequests.push(m)
@@ -256,6 +259,8 @@ export function useInboxPoller({
         planApprovalRequests.push(m)
       } else if (heartbeat) {
         heartbeatMessages.push(m)
+      } else if (forceShutdown) {
+        forceShutdownMessages.push(m)
       } else {
         regularMessages.push(m)
       }
@@ -818,6 +823,56 @@ export function useInboxPoller({
         }
 
         // Pass through for UI rendering - the component will render it nicely
+        regularMessages.push(m)
+      }
+    }
+
+    // Handle force shutdown messages (leader side) — for in-process teammates,
+    // trigger the AbortController directly; for pane-based teammates, kill the pane.
+    if (
+      forceShutdownMessages.length > 0 &&
+      isTeamLead(currentAppState.teamContext)
+    ) {
+      logForDebugging(
+        `[InboxPoller] Found ${forceShutdownMessages.length} force shutdown message(s)`,
+      )
+
+      for (const m of forceShutdownMessages) {
+        const parsed = isForceShutdown(m.text)
+        if (!parsed) continue
+
+        logForDebugging(
+          `[InboxPoller] Force shutdown from ${parsed.from} targeting ${m.from}`,
+        )
+
+        // For in-process teammates, find the task and abort directly
+        for (const [tid, task] of Object.entries(currentAppState.tasks)) {
+          if (
+            isInProcessTeammateTask(task) &&
+            task.identity.agentName === m.from &&
+            task.status === 'running'
+          ) {
+            setAppState(prev => {
+              const t = prev.tasks[tid]
+              if (
+                t &&
+                t.type === 'in_process_teammate' &&
+                t.status === 'running'
+              ) {
+                t.abortController?.abort()
+                logForDebugging(
+                  `[InboxPoller] Aborted in-process teammate ${m.from} (${tid}) via force shutdown`,
+                )
+              }
+              return prev
+            })
+            break
+          }
+        }
+      }
+
+      // Pass through for logging/UI rendering
+      for (const m of forceShutdownMessages) {
         regularMessages.push(m)
       }
     }

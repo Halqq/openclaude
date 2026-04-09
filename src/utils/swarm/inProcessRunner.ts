@@ -88,8 +88,10 @@ import { claimTask, listTasks, type Task, updateTask } from '../tasks.js'
 import type { TeammateContext } from '../teammateContext.js'
 import { runWithTeammateContext } from '../teammateContext.js'
 import {
+  createHeartbeatMessage,
   createIdleNotification,
   getLastPeerDmSummary,
+  isForceShutdown,
   isPermissionResponse,
   isShutdownRequest,
   markMessageAsReadByIndex,
@@ -112,6 +114,7 @@ import { TEAMMATE_SYSTEM_PROMPT_ADDENDUM } from './teammatePromptAddendum.js'
 type SetAppStateFn = (updater: (prev: AppState) => AppState) => void
 
 const PERMISSION_POLL_INTERVAL_MS = 500
+const HEARTBEAT_INTERVAL_MS = 15_000
 
 /**
  * Creates a canUseTool function for in-process teammates that properly resolves
@@ -566,7 +569,7 @@ async function sendMessageToLeader(
   color: string | undefined,
   teamName: string,
 ): Promise<void> {
-  await writeToMailbox(
+  const delivered = await writeToMailbox(
     TEAM_LEAD_NAME,
     {
       from,
@@ -576,6 +579,11 @@ async function sendMessageToLeader(
     },
     teamName,
   )
+  if (!delivered) {
+    logForDebugging(
+      `[inProcessRunner] Failed to deliver message to leader from ${from} — mailbox write failed after retries`,
+    )
+  }
 }
 
 /**
@@ -682,6 +690,11 @@ type WaitResult =
       originalMessage: string
     }
   | {
+      type: 'force_shutdown'
+      request: ReturnType<typeof isForceShutdown>
+      originalMessage: string
+    }
+  | {
       type: 'new_message'
       message: string
       from: string
@@ -781,20 +794,48 @@ async function waitForNextPromptOrShutdown(
         identity.teamName,
       )
 
-      // Scan all unread messages for shutdown requests (highest priority).
-      // readMailbox() already reads all messages from disk, so this scan
-      // adds only ~1-2ms of JSON parsing overhead.
+      // Scan all unread messages for force_shutdown (absolute priority) and
+      // shutdown_request (second priority). readMailbox() already reads all
+      // messages from disk, so this scan adds only ~1-2ms of JSON parsing.
+      let forceShutdownIndex = -1
+      let forceShutdownParsed: ReturnType<typeof isForceShutdown> = null
       let shutdownIndex = -1
       let shutdownParsed: ReturnType<typeof isShutdownRequest> = null
       for (let i = 0; i < allMessages.length; i++) {
         const m = allMessages[i]
         if (m && !m.read) {
+          // Force shutdown has absolute priority — check first
+          const forceParsed = isForceShutdown(m.text)
+          if (forceParsed) {
+            forceShutdownIndex = i
+            forceShutdownParsed = forceParsed
+            break
+          }
+          // Regular shutdown is second priority
           const parsed = isShutdownRequest(m.text)
           if (parsed) {
             shutdownIndex = i
             shutdownParsed = parsed
-            break
+            // Don't break — keep scanning for force_shutdown
           }
+        }
+      }
+
+      // Force shutdown takes absolute priority over regular shutdown
+      if (forceShutdownIndex !== -1) {
+        const msg = allMessages[forceShutdownIndex]!
+        logForDebugging(
+          `[inProcessRunner] ${identity.agentName} received FORCE shutdown from ${forceShutdownParsed?.from}`,
+        )
+        await markMessageAsReadByIndex(
+          identity.agentName,
+          identity.teamName,
+          forceShutdownIndex,
+        )
+        return {
+          type: 'force_shutdown',
+          request: forceShutdownParsed,
+          originalMessage: msg.text,
         }
       }
 
@@ -1027,6 +1068,29 @@ export async function runInProcessTeammate(
   )
   let currentPrompt = wrappedInitialPrompt
   let shouldExit = false
+
+  // Start heartbeat to leader so the leader can detect if this teammate
+  // becomes unresponsive (infinite loop, deadlock, etc.).
+  // Matches the 15s interval used by process-based teammates (teammateInit.ts).
+  const heartbeatInterval = setInterval(async () => {
+    try {
+      await writeToMailbox(
+        TEAM_LEAD_NAME,
+        {
+          from: identity.agentName,
+          text: jsonStringify(createHeartbeatMessage(identity.agentName)),
+          timestamp: new Date().toISOString(),
+          color: identity.color,
+        },
+        identity.teamName,
+      )
+    } catch (err) {
+      logForDebugging(
+        `[inProcessRunner] ${identity.agentName} heartbeat write failed: ${err}`,
+      )
+    }
+  }, HEARTBEAT_INTERVAL_MS)
+  heartbeatInterval.unref()
 
   // Try to claim an available task immediately so the UI can show activity
   // from the very start. The idle loop handles claiming for subsequent tasks.
@@ -1396,6 +1460,15 @@ export async function runInProcessTeammate(
           )
           break
 
+        case 'force_shutdown':
+          // Force shutdown is non-negotiable — exit immediately without
+          // passing to the model.
+          logForDebugging(
+            `[inProcessRunner] ${identity.agentId} force shutdown by ${waitResult.request?.from}: ${waitResult.request?.reason || 'no reason'}`,
+          )
+          shouldExit = true
+          break
+
         case 'new_message':
           // New prompt from leader or teammate
           logForDebugging(
@@ -1546,6 +1619,8 @@ export async function runInProcessTeammate(
       error: errorMessage,
       messages: allMessages,
     }
+  } finally {
+    clearInterval(heartbeatInterval)
   }
 }
 

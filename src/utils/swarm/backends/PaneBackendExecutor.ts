@@ -175,7 +175,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
       }
 
       // Send initial instructions to teammate via mailbox
-      await writeToMailbox(
+      const delivered = await writeToMailbox(
         config.name,
         {
           from: 'team-lead',
@@ -184,6 +184,11 @@ export class PaneBackendExecutor implements TeammateExecutor {
         },
         config.teamName,
       )
+      if (!delivered) {
+        logForDebugging(
+          `[PaneBackendExecutor] Failed to deliver initial prompt to ${config.name} — all mailbox write retries exhausted`,
+        )
+      }
 
       logForDebugging(
         `[PaneBackendExecutor] Spawned teammate ${agentId} in pane ${paneId}`,
@@ -227,7 +232,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
 
     const { agentName, teamName } = parsed
 
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       agentName,
       {
         text: message.text,
@@ -237,6 +242,12 @@ export class PaneBackendExecutor implements TeammateExecutor {
       },
       teamName,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[PaneBackendExecutor] Failed to deliver message to ${agentId} — all mailbox write retries exhausted`,
+      )
+    }
 
     logForDebugging(
       `[PaneBackendExecutor] sendMessage() completed for ${agentId}`,
@@ -272,7 +283,7 @@ export class PaneBackendExecutor implements TeammateExecutor {
       reason,
     }
 
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       agentName,
       {
         from: 'team-lead',
@@ -281,6 +292,12 @@ export class PaneBackendExecutor implements TeammateExecutor {
       },
       teamName,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[PaneBackendExecutor] Failed to deliver shutdown request to ${agentId} — all mailbox write retries exhausted`,
+      )
+    }
 
     logForDebugging(
       `[PaneBackendExecutor] terminate() sent shutdown request to ${agentId}`,

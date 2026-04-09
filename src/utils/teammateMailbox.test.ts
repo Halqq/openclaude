@@ -83,8 +83,9 @@ const baseMessage = {
 
 describe('writeToMailbox — lock succeeds immediately', () => {
   test('writes the message to the inbox file', async () => {
-    await writeToMailbox('leader', baseMessage, 'test-team')
+    const result = await writeToMailbox('leader', baseMessage, 'test-team')
 
+    expect(result).toBe(true)
     const messages = await readMailbox('leader', 'test-team')
     expect(messages).toHaveLength(1)
     expect(messages[0]?.text).toBe('hello')
@@ -92,8 +93,10 @@ describe('writeToMailbox — lock succeeds immediately', () => {
   })
 
   test('appends to existing messages', async () => {
-    await writeToMailbox('leader', baseMessage, 'test-team')
-    await writeToMailbox('leader', { ...baseMessage, text: 'second' }, 'test-team')
+    const r1 = await writeToMailbox('leader', baseMessage, 'test-team')
+    expect(r1).toBe(true)
+    const r2 = await writeToMailbox('leader', { ...baseMessage, text: 'second' }, 'test-team')
+    expect(r2).toBe(true)
 
     const messages = await readMailbox('leader', 'test-team')
     expect(messages).toHaveLength(2)
@@ -112,8 +115,9 @@ describe('writeToMailbox — lock fails then succeeds (retry logic)', () => {
       return async () => {}
     })
 
-    await writeToMailbox('leader', baseMessage, 'test-team')
+    const result = await writeToMailbox('leader', baseMessage, 'test-team')
 
+    expect(result).toBe(true)
     expect(callCount).toBe(2)
     const messages = await readMailbox('leader', 'test-team')
     expect(messages).toHaveLength(1)
@@ -129,8 +133,9 @@ describe('writeToMailbox — lock fails then succeeds (retry logic)', () => {
       return async () => {}
     })
 
-    await writeToMailbox('leader', baseMessage, 'test-team')
+    const result = await writeToMailbox('leader', baseMessage, 'test-team')
 
+    expect(result).toBe(true)
     expect(callCount).toBe(3)
     const messages = await readMailbox('leader', 'test-team')
     expect(messages).toHaveLength(1)
@@ -141,13 +146,15 @@ describe('writeToMailbox — lock fails then succeeds (retry logic)', () => {
 // ---------------------------------------------------------------------------
 
 describe('writeToMailbox — all attempts fail', () => {
-  test('logs error when all lock attempts are exhausted', async () => {
+  test('returns false and logs error when all lock attempts are exhausted', async () => {
     mockLock.mockImplementation(async () => {
       throw new Error('ELOCKED: lock always fails')
     })
 
-    await writeToMailbox('leader', baseMessage, 'test-team')
+    const result = await writeToMailbox('leader', baseMessage, 'test-team')
 
+    // Must return false — caller can detect failure
+    expect(result).toBe(false)
     // Must have tried MAILBOX_WRITE_MAX_ATTEMPTS (4) times
     expect(mockLock.mock.calls.length).toBe(4)
     // Error must be reported — message was not silently discarded

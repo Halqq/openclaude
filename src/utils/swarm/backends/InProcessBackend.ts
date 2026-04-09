@@ -165,7 +165,7 @@ export class InProcessBackend implements TeammateExecutor {
     const { agentName, teamName } = parsed
 
     // Write to file-based mailbox
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       agentName,
       {
         text: message.text,
@@ -175,6 +175,12 @@ export class InProcessBackend implements TeammateExecutor {
       },
       teamName,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[InProcessBackend] Failed to deliver message to ${agentId} — all mailbox write retries exhausted`,
+      )
+    }
 
     logForDebugging(`[InProcessBackend] sendMessage() completed for ${agentId}`)
   }
@@ -232,7 +238,7 @@ export class InProcessBackend implements TeammateExecutor {
 
     // Send to teammate's mailbox
     const teammateAgentName = task.identity.agentName
-    await writeToMailbox(
+    const delivered = await writeToMailbox(
       teammateAgentName,
       {
         from: 'team-lead',
@@ -241,6 +247,12 @@ export class InProcessBackend implements TeammateExecutor {
       },
       task.identity.teamName,
     )
+
+    if (!delivered) {
+      logForDebugging(
+        `[InProcessBackend] Failed to deliver shutdown request to ${agentId} — all mailbox write retries exhausted`,
+      )
+    }
 
     // Mark the task as shutdown requested
     requestTeammateShutdown(task.id, this.context.setAppState)

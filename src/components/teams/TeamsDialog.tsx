@@ -26,7 +26,8 @@ import { getSwarmSocketName, TMUX_COMMAND } from '../../utils/swarm/constants.js
 import { addHiddenPaneId, removeHiddenPaneId, removeMemberFromTeam, setMemberMode, setMultipleMemberModes } from '../../utils/swarm/teamHelpers.js';
 import { listTasks, type Task, unassignTeammateTasks } from '../../utils/tasks.js';
 import { getTeammateStatuses, type TeammateStatus, type TeamSummary } from '../../utils/teamDiscovery.js';
-import { createModeSetRequestMessage, sendShutdownRequestToMailbox, writeToMailbox } from '../../utils/teammateMailbox.js';
+import { createModeSetRequestMessage, writeToMailbox } from '../../utils/teammateMailbox.js';
+import { sendShutdownWithEscalation } from '../../utils/swarm/shutdownEscalation.js';
 import { Dialog } from '../design-system/Dialog.js';
 import ThemedText from '../design-system/ThemedText.js';
 type Props = {
@@ -166,9 +167,9 @@ export function TeamsDialog({
     if (input === 's') {
       if (dialogLevel.type === 'teammateList' && teammateStatuses[selectedIndex]) {
         const teammate = teammateStatuses[selectedIndex];
-        void sendShutdownRequestToMailbox(teammate.name, dialogLevel.teamName, 'Graceful shutdown requested by team lead');
+        void sendShutdownWithEscalation({ targetName: teammate.name, teamName: dialogLevel.teamName, reason: 'Graceful shutdown requested by team lead' });
       } else if (dialogLevel.type === 'teammateDetail' && currentTeammate) {
-        void sendShutdownRequestToMailbox(currentTeammate.name, dialogLevel.teamName, 'Graceful shutdown requested by team lead');
+        void sendShutdownWithEscalation({ targetName: currentTeammate.name, teamName: dialogLevel.teamName, reason: 'Graceful shutdown requested by team lead' });
         goBackToList();
       }
       return;

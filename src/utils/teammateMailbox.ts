@@ -141,7 +141,7 @@ export async function writeToMailbox(
   recipientName: string,
   message: Omit<TeammateMessage, 'read'>,
   teamName?: string,
-): Promise<void> {
+): Promise<boolean> {
   await ensureInboxDir(teamName)
 
   const inboxPath = getInboxPath(recipientName, teamName)
@@ -162,7 +162,7 @@ export async function writeToMailbox(
         `[TeammateMailbox] writeToMailbox: failed to create inbox file: ${error}`,
       )
       logError(error)
-      return
+      return false
     }
   }
 
@@ -196,7 +196,7 @@ export async function writeToMailbox(
       logForDebugging(
         `[TeammateMailbox] Wrote message to ${recipientName}'s inbox from ${message.from}`,
       )
-      return
+      return true
     } catch (error) {
       lastError = error
       logForDebugging(
@@ -213,6 +213,7 @@ export async function writeToMailbox(
     `[TeammateMailbox] Failed to write to inbox for ${recipientName} after ${MAILBOX_WRITE_MAX_ATTEMPTS} attempts: ${lastError}`,
   )
   logError(lastError)
+  return false
 }
 
 /**
@@ -863,6 +864,101 @@ export function isHeartbeat(messageText: string): HeartbeatMessage | null {
 }
 
 /**
+ * Force shutdown message sent from leader to teammate as an emergency override.
+ * Unlike shutdown_request, this is NOT cooperative — the teammate must comply immediately.
+ */
+export type ForceShutdownMessage = {
+  type: 'force_shutdown'
+  requestId: string
+  from: string
+  reason?: string
+  timestamp: string
+}
+
+export const ForceShutdownMessageSchema = lazySchema(() =>
+  z.object({
+    type: z.literal('force_shutdown'),
+    requestId: z.string(),
+    from: z.string(),
+    reason: z.string().optional(),
+    timestamp: z.string(),
+  }),
+)
+
+/**
+ * Creates a force shutdown message to send to a teammate.
+ */
+export function createForceShutdownMessage(params: {
+  requestId: string
+  from: string
+  reason?: string
+}): ForceShutdownMessage {
+  return {
+    type: 'force_shutdown',
+    requestId: params.requestId,
+    from: params.from,
+    reason: params.reason,
+    timestamp: new Date().toISOString(),
+  }
+}
+
+/**
+ * Checks if a message text contains a force shutdown request.
+ */
+export function isForceShutdown(
+  messageText: string,
+): ForceShutdownMessage | null {
+  try {
+    const result = ForceShutdownMessageSchema().safeParse(
+      jsonParse(messageText),
+    )
+    if (result.success) return result.data
+  } catch {
+    // Not JSON
+  }
+  return null
+}
+
+/**
+ * Sends a force shutdown request to a teammate's mailbox.
+ * This is an emergency override — the teammate must comply immediately.
+ */
+export async function sendForceShutdownRequestToMailbox(
+  targetName: string,
+  teamName?: string,
+  reason?: string,
+): Promise<{ requestId: string; target: string }> {
+  const resolvedTeamName = teamName || getTeamName()
+  const senderName = getAgentName() || TEAM_LEAD_NAME
+  const requestId = generateRequestId('force_shutdown', targetName)
+
+  const forceShutdownMessage = createForceShutdownMessage({
+    requestId,
+    from: senderName,
+    reason,
+  })
+
+  const delivered = await writeToMailbox(
+    targetName,
+    {
+      from: senderName,
+      text: jsonStringify(forceShutdownMessage),
+      timestamp: new Date().toISOString(),
+      color: getTeammateColor(),
+    },
+    resolvedTeamName,
+  )
+
+  if (!delivered) {
+    throw new Error(
+      `Failed to deliver force_shutdown message to ${targetName} after ${MAILBOX_WRITE_MAX_ATTEMPTS} attempts`,
+    )
+  }
+
+  return { requestId, target: targetName }
+}
+
+/**
  * Creates a shutdown rejected message to send to the team leader
  */
 export function createShutdownRejectedMessage(params: {
@@ -908,7 +1004,7 @@ export async function sendShutdownRequestToMailbox(
     reason,
   })
 
-  await writeToMailbox(
+  const delivered = await writeToMailbox(
     targetName,
     {
       from: senderName,
@@ -918,6 +1014,12 @@ export async function sendShutdownRequestToMailbox(
     },
     resolvedTeamName,
   )
+
+  if (!delivered) {
+    throw new Error(
+      `Failed to deliver shutdown request to ${targetName} after ${MAILBOX_WRITE_MAX_ATTEMPTS} attempts`,
+    )
+  }
 
   return { requestId, target: targetName }
 }
@@ -1148,7 +1250,8 @@ export function isStructuredProtocolMessage(messageText: string): boolean {
       type === 'mode_set_request' ||
       type === 'plan_approval_request' ||
       type === 'plan_approval_response' ||
-      type === 'heartbeat'
+      type === 'heartbeat' ||
+      type === 'force_shutdown'
     )
   } catch {
     return false

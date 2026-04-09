@@ -102,15 +102,17 @@ export function initializeTeammateHooks(
   // work is done.
   const HEARTBEAT_INTERVAL_MS = 15_000
   const heartbeatInterval = setInterval(async () => {
-    await writeToMailbox(leadAgentName, {
+    const delivered = await writeToMailbox(leadAgentName, {
       from: agentName,
       text: jsonStringify(createHeartbeatMessage(agentName)),
       timestamp: new Date().toISOString(),
       color: getTeammateColor(),
     })
-    logForDebugging(
-      `[TeammateInit] Sent heartbeat to leader ${leadAgentName}`,
-    )
+    if (delivered) {
+      logForDebugging(
+        `[TeammateInit] Sent heartbeat to leader ${leadAgentName}`,
+      )
+    }
   }, HEARTBEAT_INTERVAL_MS)
   heartbeatInterval.unref()
 
